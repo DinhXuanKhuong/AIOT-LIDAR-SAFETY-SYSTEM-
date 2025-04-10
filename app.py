@@ -261,7 +261,7 @@ def main():
     window.show()
 
     # Real-time simulation with multiple files
-    pcd_files = sorted(glob.glob("D:/HACKATHON/wires_boxes/v1.0-mini/samples/LIDAR_TOP/*.pcd.bin"))  # Update directory
+    pcd_files = sorted(glob.glob("LIDAR_TOP/*.pcd.bin"))  # Update directory
     if not pcd_files:
         print("No .bin files found in the specified directory.")
         window.update_data(None, {}, ["No files found."], ["Check directory path."])
