@@ -23,7 +23,7 @@ The **AIOT-LIDAR-SAFETY-SYSTEM** is an innovative safety solution that leverages
 - numpy
 - PyQt5
    ```bash
-   !pip install open3d scikit-learn matplotlib numpy PyQt5
+   !pip install "numpy<2" open3d scikit-learn PyQt5 matplotlib pygame
    ```
 
 
