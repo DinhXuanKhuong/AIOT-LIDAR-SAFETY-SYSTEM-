@@ -14,18 +14,27 @@ import os
 import time
 import glob
 from bisect import bisect_left
-from LSTM_Model import SimpleLSTM
+from Hybrid_CNN_LSTM import HybridCNNLSTM  # Updated import
 import torch
 import json
 from matplotlib.lines import Line2D
 
 # Load pretrained model
-model = SimpleLSTM(input_size=5, hidden_size=32, num_layers=1, prediction_horizon=6, dropout=0.3)
-model.load_state_dict(torch.load("best_lstm_model.pth", map_location=torch.device("cpu")))
+model = HybridCNNLSTM(input_size=6, hidden_size=32, num_layers=1, prediction_horizon=6, dropout=0.3)
+model_path = "best_lstm_model_new.pth"
+try:
+    checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+except RuntimeError as e:
+    print(f"Error loading model: {e}")
+    sys.exit(1)
 model.eval()
 
 # Load normalization stats
-with open("normalization_stats.json", "r") as f:
+with open("normalization_stats_new.json", "r") as f:
     norm_stats = json.load(f)
 
 def prepare_lstm_input(past_seq, stats):
@@ -33,9 +42,20 @@ def prepare_lstm_input(past_seq, stats):
     past_seq[:, :2] = (past_seq[:, :2] - stats["pos_mean"]) / stats["pos_std"]
     past_seq[:, 2:4] = (past_seq[:, 2:4] - stats["vel_mean"]) / stats["vel_std"]
     past_seq[:, 4] = (past_seq[:, 4] - stats["heading_mean"]) / stats["heading_std"]
+    past_seq[:, 5] = (past_seq[:, 5] - stats["dist_mean"]) / stats["dist_std"]
     return torch.tensor(past_seq, dtype=torch.float32).unsqueeze(0)
 
 obstacle_histories = {}
+
+def compute_relative_distance(centroid, obstacles):
+    """Compute distance to nearest other obstacle."""
+    min_dist = float('inf')
+    for other_id, other_obs in obstacles.items():
+        other_centroid = other_obs["centroid"]
+        dist = np.linalg.norm(centroid[:2] - other_centroid[:2])
+        if dist < min_dist and dist > 0:
+            min_dist = dist
+    return min_dist if min_dist != float('inf') else 10.0
 
 def predict_motion_for_obstacles(obstacles, timestamp, stats):
     predictions = {}
@@ -48,7 +68,8 @@ def predict_motion_for_obstacles(obstacles, timestamp, stats):
             delta = cluster_points[-1] - cluster_points[0]
             velocity = delta[:2] / 0.1
         yaw = np.arctan2(velocity[1], velocity[0])
-        state = list(centroid[:2]) + list(velocity) + [yaw]
+        rel_dist = compute_relative_distance(centroid, obstacles)
+        state = list(centroid[:2]) + list(velocity) + [yaw, rel_dist]
         if obs_id not in obstacle_histories:
             obstacle_histories[obs_id] = []
         obstacle_histories[obs_id].append((timestamp, state))
@@ -356,7 +377,7 @@ class DriverAlertApp(QMainWindow):
                 closest_file = cam_paths[-1]
             else:
                 closest_file = cam_paths[idx] if abs(cam_timestamps[idx] - lidar_timestamp) < abs(cam_timestamps[idx-1] - lidar_timestamp) else cam_paths[idx-1]
-            pixmap = QPixmap(closest_file).scaled(400, 300, Qt.KeepAspectRatio)
+            pixmap = QPixmap(closest_file).scaled(600, 500, Qt.KeepAspectRatio)
             label.setPixmap(pixmap)
 
     def show_3d_view(self):
@@ -365,7 +386,7 @@ class DriverAlertApp(QMainWindow):
             return
         points = np.asarray(self.pcd.points)
         colors = np.asarray(self.pcd.colors)
-        for obs in self.obstacles.values():  # Fixed: obstacles -> self.obstacles
+        for obs in self.obstacles.values():
             obs_points = obs["points"]
             mask = np.isin(points, obs_points).all(axis=1)
             colors[mask] = [1, 0, 0]
