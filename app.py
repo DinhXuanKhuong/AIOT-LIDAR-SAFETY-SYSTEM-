@@ -1,5 +1,6 @@
 import sys
 import numpy as np
+import tkinter as tk
 import open3d as o3d
 from sklearn.cluster import DBSCAN
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
@@ -7,11 +8,96 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
 import pygame
 import os
 import time
 import glob
 from bisect import bisect_left
+from LSTM_Model import SimpleLSTM  # đã có
+import torch
+import json
+from PyQt5.QtWidgets import QCheckBox
+from matplotlib.lines import Line2D
+
+# Load pretrained model
+model = SimpleLSTM(input_size=5, hidden_size=32, num_layers=1, prediction_horizon=6, dropout=0.3)
+model.load_state_dict(torch.load("best_lstm_model.pth", map_location=torch.device("cpu")))
+model.eval()
+
+# Load normalization stats
+with open("D:/HACKATHON/wires_boxes/normalization_stats.json", "r") as f:
+    norm_stats = json.load(f)
+
+
+def prepare_lstm_input(past_seq, stats):
+    past_seq = np.array(past_seq)
+    past_seq[:, :2] = (past_seq[:, :2] - stats["pos_mean"]) / stats["pos_std"]
+    past_seq[:, 2:4] = (past_seq[:, 2:4] - stats["vel_mean"]) / stats["vel_std"]
+    past_seq[:, 4] = (past_seq[:, 4] - stats["heading_mean"]) / stats["heading_std"]
+    return torch.tensor(past_seq, dtype=torch.float32).unsqueeze(0)
+
+
+
+obstacle_histories = {}  # Global: lưu lịch sử chuyển động
+
+def predict_motion_for_obstacles(obstacles, timestamp, stats):
+    predictions = {}
+
+    for obs_id, obs in obstacles.items():
+        centroid = obs["centroid"]
+        cluster_points = obs["points"]
+
+        # Ước lượng vận tốc đơn giản bằng 2 điểm trong cluster
+        if len(cluster_points) < 2:
+            velocity = [0.0, 0.0]
+        else:
+            delta = cluster_points[-1] - cluster_points[0]
+            velocity = delta[:2] / 0.1  # giả định mỗi frame cách nhau ~0.1s
+
+        yaw = np.arctan2(velocity[1], velocity[0])
+        state = list(centroid[:2]) + list(velocity) + [yaw]
+
+        # --- Lưu lịch sử cho object này ---
+        if obs_id not in obstacle_histories:
+            obstacle_histories[obs_id] = []
+        obstacle_histories[obs_id].append((timestamp, state))
+
+        # Sort theo timestamp để đảm bảo đúng thứ tự
+        history = sorted(obstacle_histories[obs_id], key=lambda x: x[0])
+
+        # Nếu chưa đủ 3 bước -> fallback bằng cách sao chép bước cuối
+        if len(history) < 3:
+            while len(history) < 3:
+                history.insert(0, history[0])
+
+        # Lấy 3 bước gần nhất
+        past_seq = [s for _, s in history[-3:]]
+
+        # Chuẩn hóa và đưa vào model
+        input_tensor = prepare_lstm_input(past_seq, stats)
+        with torch.no_grad():
+            future_vels = model(input_tensor).squeeze(0).numpy()
+
+        # Denormalize
+        future_vels = future_vels * stats["vel_std"] + stats["vel_mean"]
+
+        # Dự đoán vị trí tương lai
+        dt = 0.5
+        pos = np.array(past_seq[-1][:2])
+        future_positions = []
+        for v in future_vels:
+            pos = pos + np.array(v) * dt
+            future_positions.append(pos.copy())
+
+        predictions[obs_id] = future_positions
+
+    return predictions
+
+
+
+
+
 
 # --- Data Loading and Preprocessing ---
 def load_nuscenes_pcd_bin(file_path):
@@ -136,6 +222,8 @@ class DriverAlertApp(QMainWindow):
         # Left: 2D LIDAR View
         lidar_widget = QWidget()
         lidar_layout = QVBoxLayout(lidar_widget)
+
+        # --- Chính: 2D LIDAR View ---
         self.fig = Figure(figsize=(4, 4))
         self.canvas = FigureCanvas(self.fig)
         self.ax = self.fig.add_subplot(111)
@@ -143,6 +231,16 @@ class DriverAlertApp(QMainWindow):
         self.ax.set_ylabel("Y (m)")
         self.ax.set_title("Top-Down LIDAR View")
         lidar_layout.addWidget(self.canvas)
+
+        # --- Mới: Prediction View ---
+        self.pred_fig = Figure(figsize=(4, 3))
+        self.pred_canvas = FigureCanvas(self.pred_fig)
+        self.pred_ax = self.pred_fig.add_subplot(111)
+        self.pred_ax.set_title("Predicted Paths")
+        self.pred_ax.set_xlabel("X (m)")
+        self.pred_ax.set_ylabel("Y (m)")
+        lidar_layout.addWidget(self.pred_canvas)
+
         main_layout.addWidget(lidar_widget, stretch=1)
 
         # Center: Camera Images
@@ -217,6 +315,19 @@ class DriverAlertApp(QMainWindow):
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setAlignment(Qt.AlignCenter)
+        
+        # legend_frame = tk.Frame(right_layout, bg='white', padx=10, pady=10)
+
+        # # Chú thích đường kẻ
+        # tk.Label(legend_frame, text='Legend:', font=('Arial', 12, 'bold'), bg='white').pack(anchor='w')
+
+        # tk.Label(legend_frame, text='■ Safe path', fg='green', bg='white').pack(anchor='w')
+        # tk.Label(legend_frame, text='■ Collision risk', fg='orange', bg='white').pack(anchor='w')
+        # tk.Label(legend_frame, text='■ Danger close', fg='red', bg='white').pack(anchor='w')
+        # tk.Label(legend_frame, text='■ Your car', fg='lightblue', bg='white').pack(anchor='w')
+        # tk.Label(legend_frame, text='▶ Predicted direction', fg='black', bg='white').pack(anchor='w')
+
+        # legend_frame.pack(pady=10)
 
         title = QLabel("Driver Alert Dashboard")
         title.setStyleSheet("font-size: 18pt; font-weight: bold; color: #333;")
@@ -248,13 +359,15 @@ class DriverAlertApp(QMainWindow):
         self.pcd = None
         self.obstacles = {}
         self.ring_data = None
+        
+        
+    
 
         # Blinking for critical alerts
         self.blink_timer = QTimer()
         self.blink_timer.timeout.connect(self.toggle_alert_color)
 
     def update_2d_view(self, pcd, obstacles):
-        """Update the 2D top-down view with intensity-based colors."""
         self.ax.clear()
         points = np.asarray(pcd.points)
         colors = np.asarray(pcd.colors)
@@ -266,7 +379,78 @@ class DriverAlertApp(QMainWindow):
         self.ax.set_xlabel("X (m)")
         self.ax.set_ylabel("Y (m)")
         self.ax.set_title("Top-Down LIDAR View")
+        
+        
         self.canvas.draw()
+
+        # --- Vẽ vào khung dự đoán ---
+        # --- Dự đoán hướng di chuyển ---
+        self.pred_ax.clear()
+        predictions = predict_motion_for_obstacles(obstacles, int(time.time() * 1000), norm_stats)
+
+        # Vẽ vùng xe - trung tâm tọa độ
+        car_size = 2.0  # chiều dài/chiều rộng xe
+        self.pred_ax.add_patch(plt.Rectangle((-car_size/4, -car_size/4), car_size, car_size,
+                                            linewidth=1, edgecolor='deepskyblue', facecolor='lightblue', label='Ego Vehicle'))
+
+# Vẽ đường dự đoán
+        for obs_id, path in predictions.items():
+            xs, ys = zip(*path)
+            final_point = np.array(path[-1])
+            start_point = np.array(path[0])
+            direction = final_point - start_point
+
+            # Độ dài để xác định độ nguy hiểm
+            distance = np.linalg.norm(final_point)
+
+            # Màu theo nguy cơ
+            if distance < 2.0:
+                color = 'red'
+            elif distance < 4.0:
+                color = 'orange'
+            else:
+                color = 'green'
+            angle_to_front = np.arccos(direction[0] / (np.linalg.norm(direction) + 1e-6))
+            if np.abs(angle_to_front) < np.pi / 6 and distance < 4.0:
+                color = 'red'  # sắp đâm vào xe
+            # Đường đi
+            self.pred_ax.plot(xs, ys, linestyle='--', color=color, linewidth=1)
+            
+            # Vẽ mũi tên hướng đi
+            self.pred_ax.arrow(xs[-2], ys[-2], direction[0]*0.2, direction[1]*0.2,
+                            head_width=0.3, head_length=0.5, fc=color, ec=color)
+        # Nếu muốn vẽ toàn bộ bằng quiver:
+        self.pred_ax.quiver(xs[:-1], ys[:-1], np.diff(xs), np.diff(ys), angles='xy', scale_units='xy', scale=1, color='blue')
+
+        
+        
+        # Cấu hình trục
+        self.pred_ax.legend(loc="upper right")
+        self.pred_ax.set_xlim(-10, 10)
+        self.pred_ax.set_ylim(-10, 10)
+        self.pred_ax.set_aspect('equal', adjustable='box')
+        self.pred_ax.grid(True)
+        self.pred_ax.set_title("Predicted Paths")
+        self.pred_ax.set_xlabel("X (m)")
+        self.pred_ax.set_ylabel("Y (m)")
+        
+        # legend_elements = [
+        #     Line2D([0], [0], color='green', lw=2, linestyle='--', label='Safe path'),
+        #     Line2D([0], [0], color='orange', lw=2, linestyle='--', label='Collision risk'),
+        #     Line2D([0], [0], color='red', lw=2, linestyle='--', label='Danger close'),
+        #     Line2D([0], [0], marker='s', color='lightblue', label='Your car',
+        #         markerfacecolor='lightblue', markersize=12, linestyle='None'),
+        #     Line2D([0], [0], marker='>', color='black', label='Predicted direction',
+        #         markerfacecolor='black', markersize=10, linestyle='None')
+        # ]
+
+        # self.pred_ax.legend(handles=legend_elements, loc="upper right")
+        
+        
+        self.pred_canvas.draw()
+
+
+        
 
     def update_camera_views(self, lidar_timestamp):
         """Update camera images based on closest LIDAR timestamp."""
