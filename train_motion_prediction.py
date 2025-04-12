@@ -6,18 +6,39 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import os
 import json
-from LSTM_Model import SimpleLSTM
+from Hybrid_CNN_LSTM import HybridCNNLSTM
+from tqdm import tqdm
 from SimpleNuScenesDataset import SimpleNuScenesDataset
+import glob
 
-def train_model(model, train_loader, val_loader, device, epochs=100, patience=10):
+
+
+
+def train_model(model, train_loader, val_loader, device, epochs=100, patience=10, resume=False, checkpoint_path="best_lstm_model.pth"):
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
     criterion = nn.MSELoss()
-    train_losses, val_losses = [], []
+    
+    train_losses = []
+    val_losses = []
     best_val_loss = float('inf')
     epochs_no_improve = 0
+    start_epoch = 0
 
-    for epoch in range(epochs):
+    if resume and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        train_losses = checkpoint['train_losses']
+        val_losses = checkpoint['val_losses']
+        best_val_loss = checkpoint['best_val_loss']
+        epochs_no_improve = checkpoint['epochs_no_improve']
+        print(f"Resumed training from epoch {start_epoch}, best validation loss: {best_val_loss:.4f}")
+    elif resume:
+        print(f"No checkpoint found at {checkpoint_path}. Starting fresh training.")
+
+    for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
         for past, future in train_loader:
@@ -42,19 +63,26 @@ def train_model(model, train_loader, val_loader, device, epochs=100, patience=10
         val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0.0
         val_losses.append(val_loss)
 
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Best Val Loss: {best_val_loss:.4f}, Epochs No Improve: {epochs_no_improve}")
-
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         if val_loss < best_val_loss and val_loss > 0:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "best_lstm_model.pth")
             epochs_no_improve = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'best_val_loss': best_val_loss,
+                'epochs_no_improve': epochs_no_improve
+            }, checkpoint_path)
+            print(f"Saved best model with validation loss: {best_val_loss:.4f}")
         else:
             epochs_no_improve += 1
 
         if epochs_no_improve >= patience:
             print(f"Early stopping at epoch {epoch+1}")
             break
-
         scheduler.step(val_loss)
 
     return train_losses, val_losses
@@ -103,23 +131,85 @@ def visualize_prediction(model, dataset, sample_idx=0, device="cpu"):
     plt.savefig("prediction_visualization.png")
     plt.close()
 
-def main():
-    DATA_ROOT = "D:/HACKATHON/wires_boxes"
+def verify_scenes(data_root, scenes, sample_data_metadata, sample_map):
+    valid_scenes = []
+    scene_to_samples = {}
+    for scene in scenes:
+        scene_to_samples[scene['name']] = set()
+        sample_token = scene['first_sample_token']
+        while sample_token:
+            scene_to_samples[scene['name']].add(sample_token)
+            sample = sample_map.get(sample_token, {})
+            sample_token = sample.get('next')
+    
+    lidar_files = set(os.path.basename(f) for f in glob.glob(os.path.join(data_root, "samples/LIDAR_TOP/*.bin")))
+    for scene_name, sample_tokens in scene_to_samples.items():
+        for sd in sample_data_metadata:
+            if sd['sample_token'] in sample_tokens and 'LIDAR_TOP' in sd['filename']:
+                if os.path.basename(sd['filename']) in lidar_files:
+                    valid_scenes.append(scene_name)
+                    break
+
+    # Save valid scenes to a JSON file
+    valid_scenes_file = os.path.join(data_root, "valid_scenes.json")
+    with open(valid_scenes_file, "w") as f:
+        json.dump({"valid_scenes": valid_scenes}, f, indent=4)
+    print(f"Saved valid scenes to {valid_scenes_file}")
+    
+
+    return valid_scenes
+
+
+
+def main(resume_training=False):
+    DATA_ROOT = "/content/nuscenes"
     SEQUENCE_LENGTH = 3
     PREDICTION_HORIZON = 6
     BATCH_SIZE = 32
     EPOCHS = 100
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    CHECKPOINT_PATH = "best_lstm_model.pth"
 
-    with open(os.path.join(DATA_ROOT, "v0.1", "scene.json"), "r") as f:
+    meta_dir = os.path.join(DATA_ROOT, "v1.0-trainval")
+    with open(os.path.join(meta_dir, "scene.json"), "r") as f:
         scene_data = json.load(f)
-    all_scenes = [scene['name'] for scene in scene_data]
-    print(f"Total scenes: {len(all_scenes)}")
-    print("Scenes:", all_scenes)
+    with open(os.path.join(meta_dir, "sample.json"), "r") as f:
+        sample_data = json.load(f)
+    with open(os.path.join(meta_dir, "sample_data.json"), "r") as f:
+        sample_data_metadata = json.load(f)
 
-    train_size = int(0.7 * len(all_scenes))
-    train_scenes = all_scenes[:train_size]
-    val_scenes = all_scenes[train_size:]
+    sample_map = {sample['token']: sample for sample in sample_data}
+    all_scenes = [scene for scene in scene_data]
+    print(f"Total scenes: {len(all_scenes)}")
+
+    #valid_scenes = verify_scenes(DATA_ROOT, all_scenes, sample_data_metadata, sample_map)
+    #print(f"Valid scenes with data: {len(valid_scenes)}")
+    #print("Valid scenes:", valid_scenes)
+    # Check for existing valid_scenes.json
+    valid_scenes_file = os.path.join(DATA_ROOT, "valid_scenes.json")
+    if os.path.exists(valid_scenes_file):
+        try:
+            with open(valid_scenes_file, "r") as f:
+                valid_scenes = json.load(f)["valid_scenes"]
+            print(f"Loaded valid scenes from {valid_scenes_file}")
+        except Exception as e:
+            print(f"Error reading {valid_scenes_file}: {e}. Running scene verification.")
+            valid_scenes = verify_scenes(DATA_ROOT, all_scenes, sample_data_metadata, sample_map)
+    else:
+        print(f"No valid_scenes.json found. Running scene verification.")
+        valid_scenes = verify_scenes(DATA_ROOT, all_scenes, sample_data_metadata, sample_map)
+
+    print(f"Valid scenes with data: {len(valid_scenes)}")
+    print("Valid scenes:", valid_scenes)
+
+
+    if not valid_scenes:
+        print("No valid scenes found with data. Exiting.")
+        return
+
+    train_size = int(0.7 * len(valid_scenes))
+    train_scenes = valid_scenes[:train_size]
+    val_scenes = valid_scenes[train_size:]
     print(f"Training scenes: {train_scenes}")
     print(f"Validation scenes: {val_scenes}")
 
@@ -128,11 +218,8 @@ def main():
 
     for dataset, split in [(train_dataset, "train"), (val_dataset, "val")]:
         print(f"\nSequences per scene in {split} split:")
-        scene_sequences = {}
-        for scene_name in dataset.scenes:
-            temp_dataset = SimpleNuScenesDataset(DATA_ROOT, [scene_name], SEQUENCE_LENGTH, PREDICTION_HORIZON, split=split)
-            scene_sequences[scene_name] = len(temp_dataset.sequences)
-        for scene_name, count in scene_sequences.items():
+        for scene_name in dataset.valid_scenes:
+            count = dataset.scene_sequence_counts.get(scene_name, 0)
             print(f"Scene {scene_name}: {count} sequences")
 
     all_sequences = train_dataset.sequences + val_dataset.sequences
@@ -142,6 +229,7 @@ def main():
         positions = all_past[:, :, :2].reshape(-1, 2)
         velocities_past = all_past[:, :, 2:4].reshape(-1, 2)
         headings = all_past[:, :, 4].reshape(-1)
+        distances = all_past[:, :, 5].reshape(-1)
         velocities_future = all_future.reshape(-1, 2)
         velocities = np.concatenate([velocities_past, velocities_future], axis=0)
         pos_mean = positions.mean(axis=0)
@@ -150,6 +238,8 @@ def main():
         vel_std = velocities.std(axis=0) + 1e-6
         heading_mean = headings.mean()
         heading_std = headings.std() + 1e-6
+        dist_mean = distances.mean()
+        dist_std = distances.std() + 1e-6
     else:
         pos_mean = np.array([0.0, 0.0])
         pos_std = np.array([1.0, 1.0])
@@ -157,9 +247,11 @@ def main():
         vel_std = np.array([1.0, 1.0])
         heading_mean = 0.0
         heading_std = 1.0
+        dist_mean = 0.0
+        dist_std = 1.0
 
-    train_dataset.set_normalization_stats(pos_mean, pos_std, vel_mean, vel_std, heading_mean, heading_std)
-    val_dataset.set_normalization_stats(pos_mean, pos_std, vel_mean, vel_std, heading_mean, heading_std)
+    train_dataset.set_normalization_stats(pos_mean, pos_std, vel_mean, vel_std, heading_mean, heading_std, dist_mean, dist_std)
+    val_dataset.set_normalization_stats(pos_mean, pos_std, vel_mean, vel_std, heading_mean, heading_std, dist_mean, dist_std)
 
     normalization_stats = {
         "pos_mean": pos_mean.tolist(),
@@ -167,7 +259,9 @@ def main():
         "vel_mean": vel_mean.tolist(),
         "vel_std": vel_std.tolist(),
         "heading_mean": float(heading_mean),
-        "heading_std": float(heading_std)
+        "heading_std": float(heading_std),
+        "dist_mean": float(dist_mean),
+        "dist_std": float(dist_std)
     }
     with open(os.path.join(DATA_ROOT, "normalization_stats.json"), "w") as f:
         json.dump(normalization_stats, f)
@@ -178,11 +272,11 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    model = SimpleLSTM(input_size=5, hidden_size=32, num_layers=1, prediction_horizon=PREDICTION_HORIZON, dropout=0.3).to(DEVICE)
+    model = HybridCNNLSTM(input_size=6, hidden_size=32, num_layers=1, prediction_horizon=PREDICTION_HORIZON, dropout=0.3).to(DEVICE)
 
-    train_losses, val_losses = train_model(model, train_loader, val_loader, DEVICE, epochs=EPOCHS, patience=10)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, DEVICE, epochs=EPOCHS, patience=10, resume=resume_training, checkpoint_path=CHECKPOINT_PATH)
     plot_losses(train_losses, val_losses)
     visualize_prediction(model, val_dataset, sample_idx=0, device=DEVICE)
 
 if __name__ == "__main__":
-    main()
+    main(resume_training=False)

@@ -11,23 +11,28 @@ The **AIOT-LIDAR-SAFETY-SYSTEM** is an innovative safety solution that leverages
 
 ## Installation
 ### Clone the repository:
-   ```bash
-   git clone https://github.com/DinhXuanKhuong/AIOT-LIDAR-SAFETY-SYSTEM-.git
-   ```
+```bash
+git clone https://github.com/DinhXuanKhuong/AIOT-LIDAR-SAFETY-SYSTEM-.git
+cd AIOT-LIDAR-SAFETY-SYSTEM-/
+```
+
 ### Environment
 - Python: 3.10.x (whatever x)
-### Framework
-- open3d
-- scikit-learn
-- matplotlib
-- numpy
-- PyQt5
-   ```bash
-   !pip install "numpy<2" open3d scikit-learn PyQt5 matplotlib pygame
-   ```
 
+### Create virtual environment
+
+```bash
+python3 -m venv env
+source ./env/Scripts/activate
+```
+
+### Installed required dependencies
+```bash
+pip3 install -r requirements.txt
+```
 
 ## How to run
-   ```bash
-   python app.py
-   ```
+```bash
+python App_main.py
+
+```
