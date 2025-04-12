@@ -14,10 +14,9 @@ import os
 import time
 import glob
 from bisect import bisect_left
-from LSTM_Model import SimpleLSTM  # đã có
+from LSTM_Model import SimpleLSTM
 import torch
 import json
-from PyQt5.QtWidgets import QCheckBox
 from matplotlib.lines import Line2D
 
 # Load pretrained model
@@ -26,9 +25,8 @@ model.load_state_dict(torch.load("best_lstm_model.pth", map_location=torch.devic
 model.eval()
 
 # Load normalization stats
-with open("D:/HACKATHON/wires_boxes/normalization_stats.json", "r") as f:
+with open("normalization_stats.json", "r") as f:
     norm_stats = json.load(f)
-
 
 def prepare_lstm_input(past_seq, stats):
     past_seq = np.array(past_seq)
@@ -37,75 +35,46 @@ def prepare_lstm_input(past_seq, stats):
     past_seq[:, 4] = (past_seq[:, 4] - stats["heading_mean"]) / stats["heading_std"]
     return torch.tensor(past_seq, dtype=torch.float32).unsqueeze(0)
 
-
-
-obstacle_histories = {}  # Global: lưu lịch sử chuyển động
+obstacle_histories = {}
 
 def predict_motion_for_obstacles(obstacles, timestamp, stats):
     predictions = {}
-
     for obs_id, obs in obstacles.items():
         centroid = obs["centroid"]
         cluster_points = obs["points"]
-
-        # Ước lượng vận tốc đơn giản bằng 2 điểm trong cluster
         if len(cluster_points) < 2:
             velocity = [0.0, 0.0]
         else:
             delta = cluster_points[-1] - cluster_points[0]
-            velocity = delta[:2] / 0.1  # giả định mỗi frame cách nhau ~0.1s
-
+            velocity = delta[:2] / 0.1
         yaw = np.arctan2(velocity[1], velocity[0])
         state = list(centroid[:2]) + list(velocity) + [yaw]
-
-        # --- Lưu lịch sử cho object này ---
         if obs_id not in obstacle_histories:
             obstacle_histories[obs_id] = []
         obstacle_histories[obs_id].append((timestamp, state))
-
-        # Sort theo timestamp để đảm bảo đúng thứ tự
         history = sorted(obstacle_histories[obs_id], key=lambda x: x[0])
-
-        # Nếu chưa đủ 3 bước -> fallback bằng cách sao chép bước cuối
         if len(history) < 3:
             while len(history) < 3:
                 history.insert(0, history[0])
-
-        # Lấy 3 bước gần nhất
         past_seq = [s for _, s in history[-3:]]
-
-        # Chuẩn hóa và đưa vào model
         input_tensor = prepare_lstm_input(past_seq, stats)
         with torch.no_grad():
             future_vels = model(input_tensor).squeeze(0).numpy()
-
-        # Denormalize
         future_vels = future_vels * stats["vel_std"] + stats["vel_mean"]
-
-        # Dự đoán vị trí tương lai
         dt = 0.5
         pos = np.array(past_seq[-1][:2])
         future_positions = []
         for v in future_vels:
             pos = pos + np.array(v) * dt
             future_positions.append(pos.copy())
-
         predictions[obs_id] = future_positions
-
     return predictions
 
-
-
-
-
-
-# --- Data Loading and Preprocessing ---
 def load_nuscenes_pcd_bin(file_path):
-    """Load a nuScenes .pcd.bin file into an Open3D point cloud with intensity."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
     scan = np.fromfile(file_path, dtype=np.float32)
-    points = scan.reshape((-1, 5))  # nuScenes: x, y, z, intensity, ring
+    points = scan.reshape((-1, 5))
     xyz = points[:, :3]
     intensity = points[:, 3] / 255.0
     pcd = o3d.geometry.PointCloud()
@@ -115,7 +84,6 @@ def load_nuscenes_pcd_bin(file_path):
     return pcd, points[:, 4]
 
 def center_point_cloud(pcd, ring_data):
-    """Center the point cloud by subtracting the centroid and downsample."""
     points = np.asarray(pcd.points)
     if len(points) == 0:
         raise ValueError("Point cloud is empty.")
@@ -128,7 +96,6 @@ def center_point_cloud(pcd, ring_data):
     return pcd_downsampled, ring_data
 
 def remove_ground(pcd, ring_data, z_threshold=-1.5, ring_threshold=10):
-    """Remove ground points using z height and ring index."""
     points = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors)
     mask = (points[:, 2] > z_threshold) | (ring_data > ring_threshold)
@@ -136,9 +103,7 @@ def remove_ground(pcd, ring_data, z_threshold=-1.5, ring_threshold=10):
     pcd.colors = o3d.utility.Vector3dVector(colors[mask])
     return pcd, ring_data[mask]
 
-# --- Smart Splitting ---
 def smart_split(pcd):
-    """Split point cloud into quadrants and distance zones."""
     points = np.asarray(pcd.points)
     distances = np.linalg.norm(points, axis=1)
     quadrants = {
@@ -157,9 +122,7 @@ def smart_split(pcd):
             split_pcds[f"{quad}_{rmin}-{rmax}m"] = pcd_split
     return split_pcds
 
-# --- Obstacle Detection and Suggestions ---
 def detect_obstacles(split_pcds, min_points=100, eps=1.0):
-    """Detect obstacles in each split region using clustering."""
     obstacles = {}
     for key, pcd in split_pcds.items():
         points = np.asarray(pcd.points)
@@ -167,7 +130,7 @@ def detect_obstacles(split_pcds, min_points=100, eps=1.0):
             continue
         clustering = DBSCAN(eps=eps, min_samples=min_points).fit(points)
         labels = clustering.labels_
-        for label in set(labels) - {-1}:  # Exclude noise
+        for label in set(labels) - {-1}:
             cluster_points = points[labels == label]
             centroid = np.mean(cluster_points, axis=0)
             distance = np.linalg.norm(centroid)
@@ -179,7 +142,6 @@ def detect_obstacles(split_pcds, min_points=100, eps=1.0):
     return obstacles
 
 def classify_dangers_and_suggest(obstacles):
-    """Classify obstacles and suggest actions."""
     alerts = []
     suggestions = []
     for key, obs in obstacles.items():
@@ -204,26 +166,19 @@ def classify_dangers_and_suggest(obstacles):
         suggestions.append(suggestion)
     return alerts, suggestions
 
-# --- UI/UX with PyQt5 ---
 class DriverAlertApp(QMainWindow):
     def __init__(self, camera_files):
         super().__init__()
         self.setWindowTitle("Driver Alert System")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setGeometry(100, 100, 1400, 900)
 
-        # Store sorted camera files
         self.camera_files = camera_files
-
-        # Main layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout(main_widget)
 
-        # Left: 2D LIDAR View
         lidar_widget = QWidget()
         lidar_layout = QVBoxLayout(lidar_widget)
-
-        # --- Chính: 2D LIDAR View ---
         self.fig = Figure(figsize=(4, 4))
         self.canvas = FigureCanvas(self.fig)
         self.ax = self.fig.add_subplot(111)
@@ -231,8 +186,6 @@ class DriverAlertApp(QMainWindow):
         self.ax.set_ylabel("Y (m)")
         self.ax.set_title("Top-Down LIDAR View")
         lidar_layout.addWidget(self.canvas)
-
-        # --- Mới: Prediction View ---
         self.pred_fig = Figure(figsize=(4, 3))
         self.pred_canvas = FigureCanvas(self.pred_fig)
         self.pred_ax = self.pred_fig.add_subplot(111)
@@ -240,16 +193,11 @@ class DriverAlertApp(QMainWindow):
         self.pred_ax.set_xlabel("X (m)")
         self.pred_ax.set_ylabel("Y (m)")
         lidar_layout.addWidget(self.pred_canvas)
-
         main_layout.addWidget(lidar_widget, stretch=1)
 
-        # Center: Camera Images
         camera_widget = QWidget()
         camera_layout = QVBoxLayout(camera_widget)
-        
-        # Top row: Front cameras
         front_layout = QHBoxLayout()
-        # CAM_FRONT
         front_vbox = QVBoxLayout()
         front_title = QLabel("CAM_FRONT")
         front_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #333;")
@@ -258,7 +206,6 @@ class DriverAlertApp(QMainWindow):
         front_vbox.addWidget(front_title)
         front_vbox.addWidget(self.front_label)
         front_layout.addLayout(front_vbox)
-        # CAM_FRONT_LEFT
         front_left_vbox = QVBoxLayout()
         front_left_title = QLabel("CAM_FRONT_LEFT")
         front_left_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #333;")
@@ -267,7 +214,6 @@ class DriverAlertApp(QMainWindow):
         front_left_vbox.addWidget(front_left_title)
         front_left_vbox.addWidget(self.front_left_label)
         front_layout.addLayout(front_left_vbox)
-        # CAM_FRONT_RIGHT
         front_right_vbox = QVBoxLayout()
         front_right_title = QLabel("CAM_FRONT_RIGHT")
         front_right_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #333;")
@@ -276,10 +222,7 @@ class DriverAlertApp(QMainWindow):
         front_right_vbox.addWidget(front_right_title)
         front_right_vbox.addWidget(self.front_right_label)
         front_layout.addLayout(front_right_vbox)
-        
-        # Bottom row: Back cameras
         back_layout = QHBoxLayout()
-        # CAM_BACK
         back_vbox = QVBoxLayout()
         back_title = QLabel("CAM_BACK")
         back_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #333;")
@@ -288,7 +231,6 @@ class DriverAlertApp(QMainWindow):
         back_vbox.addWidget(back_title)
         back_vbox.addWidget(self.back_label)
         back_layout.addLayout(back_vbox)
-        # CAM_BACK_LEFT
         back_left_vbox = QVBoxLayout()
         back_left_title = QLabel("CAM_BACK_LEFT")
         back_left_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #333;")
@@ -297,7 +239,6 @@ class DriverAlertApp(QMainWindow):
         back_left_vbox.addWidget(back_left_title)
         back_left_vbox.addWidget(self.back_left_label)
         back_layout.addLayout(back_left_vbox)
-        # CAM_BACK_RIGHT
         back_right_vbox = QVBoxLayout()
         back_right_title = QLabel("CAM_BACK_RIGHT")
         back_right_title.setStyleSheet("font-size: 12pt; font-weight: bold; color: #333;")
@@ -306,40 +247,22 @@ class DriverAlertApp(QMainWindow):
         back_right_vbox.addWidget(back_right_title)
         back_right_vbox.addWidget(self.back_right_label)
         back_layout.addLayout(back_right_vbox)
-        
         camera_layout.addLayout(front_layout)
         camera_layout.addLayout(back_layout)
-        main_layout.addWidget(camera_widget, stretch=2)
+        main_layout.addWidget(camera_widget, stretch=3)
 
-        # Right: Alerts and Suggestions
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setAlignment(Qt.AlignCenter)
-        
-        # legend_frame = tk.Frame(right_layout, bg='white', padx=10, pady=10)
-
-        # # Chú thích đường kẻ
-        # tk.Label(legend_frame, text='Legend:', font=('Arial', 12, 'bold'), bg='white').pack(anchor='w')
-
-        # tk.Label(legend_frame, text='■ Safe path', fg='green', bg='white').pack(anchor='w')
-        # tk.Label(legend_frame, text='■ Collision risk', fg='orange', bg='white').pack(anchor='w')
-        # tk.Label(legend_frame, text='■ Danger close', fg='red', bg='white').pack(anchor='w')
-        # tk.Label(legend_frame, text='■ Your car', fg='lightblue', bg='white').pack(anchor='w')
-        # tk.Label(legend_frame, text='▶ Predicted direction', fg='black', bg='white').pack(anchor='w')
-
-        # legend_frame.pack(pady=10)
-
         title = QLabel("Driver Alert Dashboard")
         title.setStyleSheet("font-size: 18pt; font-weight: bold; color: #333;")
         right_layout.addWidget(title, alignment=Qt.AlignCenter)
-
         self.alert_label = QLabel("Alerts:\nInitializing...")
         self.alert_label.setStyleSheet("font-size: 14pt; color: red; background-color: #ffe6e6; padding: 10px;")
         self.alert_label.setWordWrap(True)
         self.suggestion_label = QLabel("Suggestions:\nInitializing...")
         self.suggestion_label.setStyleSheet("font-size: 14pt; color: green; background-color: #e6ffe6; padding: 10px;")
         self.suggestion_label.setWordWrap(True)
-
         button_layout = QHBoxLayout()
         self.dismiss_button = QPushButton("Dismiss Alerts")
         self.dismiss_button.setStyleSheet("font-size: 12pt; padding: 5px;")
@@ -347,23 +270,22 @@ class DriverAlertApp(QMainWindow):
         self.view_3d_button = QPushButton("View 3D Point Cloud")
         self.view_3d_button.setStyleSheet("font-size: 12pt; padding: 5px;")
         self.view_3d_button.clicked.connect(self.show_3d_view)
+        self.pause_button = QPushButton("Pause")
+        self.pause_button.setStyleSheet("font-size: 12pt; padding: 5px;")
+        self.pause_button.clicked.connect(self.toggle_pause)
         button_layout.addWidget(self.dismiss_button)
         button_layout.addWidget(self.view_3d_button)
-
+        button_layout.addWidget(self.pause_button)
         right_layout.addWidget(self.alert_label)
         right_layout.addWidget(self.suggestion_label)
         right_layout.addLayout(button_layout)
         main_layout.addWidget(right_widget, stretch=1)
 
-        # Store data
         self.pcd = None
         self.obstacles = {}
         self.ring_data = None
-        
-        
-    
+        self.is_paused = False
 
-        # Blinking for critical alerts
         self.blink_timer = QTimer()
         self.blink_timer.timeout.connect(self.toggle_alert_color)
 
@@ -379,31 +301,19 @@ class DriverAlertApp(QMainWindow):
         self.ax.set_xlabel("X (m)")
         self.ax.set_ylabel("Y (m)")
         self.ax.set_title("Top-Down LIDAR View")
-        
-        
         self.canvas.draw()
 
-        # --- Vẽ vào khung dự đoán ---
-        # --- Dự đoán hướng di chuyển ---
         self.pred_ax.clear()
         predictions = predict_motion_for_obstacles(obstacles, int(time.time() * 1000), norm_stats)
-
-        # Vẽ vùng xe - trung tâm tọa độ
-        car_size = 2.0  # chiều dài/chiều rộng xe
+        car_size = 2.0
         self.pred_ax.add_patch(plt.Rectangle((-car_size/4, -car_size/4), car_size, car_size,
                                             linewidth=1, edgecolor='deepskyblue', facecolor='lightblue', label='Ego Vehicle'))
-
-# Vẽ đường dự đoán
         for obs_id, path in predictions.items():
             xs, ys = zip(*path)
             final_point = np.array(path[-1])
             start_point = np.array(path[0])
             direction = final_point - start_point
-
-            # Độ dài để xác định độ nguy hiểm
             distance = np.linalg.norm(final_point)
-
-            # Màu theo nguy cơ
             if distance < 2.0:
                 color = 'red'
             elif distance < 4.0:
@@ -412,19 +322,10 @@ class DriverAlertApp(QMainWindow):
                 color = 'green'
             angle_to_front = np.arccos(direction[0] / (np.linalg.norm(direction) + 1e-6))
             if np.abs(angle_to_front) < np.pi / 6 and distance < 4.0:
-                color = 'red'  # sắp đâm vào xe
-            # Đường đi
+                color = 'red'
             self.pred_ax.plot(xs, ys, linestyle='--', color=color, linewidth=1)
-            
-            # Vẽ mũi tên hướng đi
             self.pred_ax.arrow(xs[-2], ys[-2], direction[0]*0.2, direction[1]*0.2,
-                            head_width=0.3, head_length=0.5, fc=color, ec=color)
-        # Nếu muốn vẽ toàn bộ bằng quiver:
-        self.pred_ax.quiver(xs[:-1], ys[:-1], np.diff(xs), np.diff(ys), angles='xy', scale_units='xy', scale=1, color='blue')
-
-        
-        
-        # Cấu hình trục
+                              head_width=0.3, head_length=0.5, fc=color, ec=color)
         self.pred_ax.legend(loc="upper right")
         self.pred_ax.set_xlim(-10, 10)
         self.pred_ax.set_ylim(-10, 10)
@@ -433,27 +334,9 @@ class DriverAlertApp(QMainWindow):
         self.pred_ax.set_title("Predicted Paths")
         self.pred_ax.set_xlabel("X (m)")
         self.pred_ax.set_ylabel("Y (m)")
-        
-        # legend_elements = [
-        #     Line2D([0], [0], color='green', lw=2, linestyle='--', label='Safe path'),
-        #     Line2D([0], [0], color='orange', lw=2, linestyle='--', label='Collision risk'),
-        #     Line2D([0], [0], color='red', lw=2, linestyle='--', label='Danger close'),
-        #     Line2D([0], [0], marker='s', color='lightblue', label='Your car',
-        #         markerfacecolor='lightblue', markersize=12, linestyle='None'),
-        #     Line2D([0], [0], marker='>', color='black', label='Predicted direction',
-        #         markerfacecolor='black', markersize=10, linestyle='None')
-        # ]
-
-        # self.pred_ax.legend(handles=legend_elements, loc="upper right")
-        
-        
         self.pred_canvas.draw()
 
-
-        
-
     def update_camera_views(self, lidar_timestamp):
-        """Update camera images based on closest LIDAR timestamp."""
         cam_dirs = {
             'CAM_FRONT': (self.front_label, self.camera_files['CAM_FRONT']),
             'CAM_FRONT_LEFT': (self.front_left_label, self.camera_files['CAM_FRONT_LEFT']),
@@ -466,7 +349,6 @@ class DriverAlertApp(QMainWindow):
             if not cam_timestamps:
                 label.setText("No images")
                 continue
-            # Find the closest timestamp
             idx = bisect_left(cam_timestamps, lidar_timestamp)
             if idx == 0:
                 closest_file = cam_paths[0]
@@ -474,31 +356,27 @@ class DriverAlertApp(QMainWindow):
                 closest_file = cam_paths[-1]
             else:
                 closest_file = cam_paths[idx] if abs(cam_timestamps[idx] - lidar_timestamp) < abs(cam_timestamps[idx-1] - lidar_timestamp) else cam_paths[idx-1]
-            pixmap = QPixmap(closest_file).scaled(200, 150, Qt.KeepAspectRatio)
+            pixmap = QPixmap(closest_file).scaled(400, 300, Qt.KeepAspectRatio)
             label.setPixmap(pixmap)
 
     def show_3d_view(self):
-        """Display the 3D point cloud with a car model and intensity colors."""
         if self.pcd is None:
             print("No point cloud data available.")
             return
         points = np.asarray(self.pcd.points)
         colors = np.asarray(self.pcd.colors)
-        for obs in self.obstacles.values():
+        for obs in self.obstacles.values():  # Fixed: obstacles -> self.obstacles
             obs_points = obs["points"]
             mask = np.isin(points, obs_points).all(axis=1)
             colors[mask] = [1, 0, 0]
         self.pcd.colors = o3d.utility.Vector3dVector(colors)
-
         car = o3d.geometry.TriangleMesh.create_box(width=2, height=1, depth=0.5)
         car.translate([-1, -0.5, -0.25])
         car.paint_uniform_color([0, 0, 1])
-
         o3d.visualization.draw_geometries([self.pcd, car], window_name="Point Cloud View",
                                          front=[0, -1, 0], lookat=[0, 0, 0], up=[0, 0, 1], zoom=0.1)
 
     def update_data(self, pcd, obstacles, alerts, suggestions, lidar_timestamp):
-        """Update the UI with new data."""
         self.pcd = pcd
         self.obstacles = obstacles
         self.alert_label.setText("Alerts:\n" + "\n".join(alerts if alerts else ["No dangers detected."]))
@@ -513,28 +391,27 @@ class DriverAlertApp(QMainWindow):
             self.play_alert_sound()
 
     def toggle_alert_color(self):
-        """Toggle alert color for blinking effect."""
         current = self.alert_label.styleSheet()
         new_color = "red" if "ffe6e6" in current else "#ff9999"
         self.alert_label.setStyleSheet(f"font-size: 14pt; color: {new_color}; background-color: #ffe6e6; padding: 10px;")
 
     def dismiss_alerts(self):
-        """Clear alerts and suggestions."""
         self.alert_label.setText("Alerts:\nNo dangers detected.")
         self.suggestion_label.setText("Suggestions:\nDrive safely.")
         self.blink_timer.stop()
 
+    def toggle_pause(self):
+        self.is_paused = not self.is_paused
+        self.pause_button.setText("Continue" if self.is_paused else "Pause")
+
     def play_alert_sound(self):
-        """Play an alert sound."""
         pygame.mixer.init()
         try:
             pygame.mixer.Sound("alert.wav").play()
         except FileNotFoundError:
             print("Warning: alert.wav not found. Skipping audio.")
 
-# --- Main Application Logic ---
 def process_pcd_file(file_path):
-    """Process a single .pcd.bin file and return data for UI."""
     try:
         pcd, ring_data = load_nuscenes_pcd_bin(file_path)
         pcd, ring_data = center_point_cloud(pcd, ring_data)
@@ -549,7 +426,6 @@ def process_pcd_file(file_path):
         return None, {}, ["Error processing file."], ["Check file path and format."], 0
 
 def load_camera_files(base_dir):
-    """Load and sort camera files by timestamp."""
     cam_dirs = ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
     camera_files = {}
     for cam in cam_dirs:
@@ -560,28 +436,24 @@ def load_camera_files(base_dir):
 
 def main():
     app = QApplication(sys.argv)
-
-    # Load and sort camera files
-    base_dir = "D:/HACKATHON/wires_boxes/v1.0-mini/samples/"
+    base_dir = "v1.0-mini/samples/"
     camera_files = load_camera_files(base_dir)
-
-    # Initialize window with camera files
     window = DriverAlertApp(camera_files)
     window.show()
-
-    # Load and sort LIDAR files
     pcd_files = sorted(glob.glob(os.path.join(base_dir, "LIDAR_TOP", "*.pcd.bin")))
     if not pcd_files:
         print("No .bin files found in the specified directory.")
         window.update_data(None, {}, ["No files found."], ["Check directory path."], 0)
     else:
         for pcd_file in pcd_files:
+            while window.is_paused:
+                app.processEvents()
+                time.sleep(0.1)
             pcd, obstacles, alerts, suggestions, timestamp = process_pcd_file(pcd_file)
             if pcd is not None:
                 window.update_data(pcd, obstacles, alerts, suggestions, timestamp)
                 app.processEvents()
                 time.sleep(0.1)
-
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
